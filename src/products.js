@@ -5,7 +5,7 @@ export const MAIN = {
   eyebrow: 'Unisex luxury denim',
   name: 'Baggi Jeans - Relaxed Fit',
   price: 48000, compareAt: 55000, rating: 4.9, reviewCount: 142,
-  images: ['baggi-1.jpg', 'baggi-2.jpg', 'baggi-3.jpg', 'baggi-4.jpg', 'baggi-5.jpg'],
+  images: ['clothes.png'],
   colors: [
     { name: 'indigo', label: 'Washed Indigo', hex: '#2b3a67' },
     { name: 'black', label: 'Washed Black', hex: '#15151a' },
@@ -43,7 +43,8 @@ export const SUBS = {
   clothing: [['baggi-jeans', 'Baggi Jeans'], ['luxury-jackets', 'Luxury Jackets'], ['short-joggers', 'Short Joggers'], ['waterproof', 'Waterproof'], ['shirts', 'Shirts'], ['combat-shorts', 'Combat Shorts'], ['longsleeves', 'Longsleeves']],
   shoes: [['sneakers', 'Sneakers'], ['crocs-mules', 'Crocs & Mules'], ['recovery-slides', 'Recovery Slides'], ['combat-boots', 'Combat Boots'], ['loafers', 'Loafers'], ['leather-sandals', 'Leather Sandals']],
 };
-const mk = (category, sub, drop, slug, name, kicker, spec, price, colors, o = {}) => ({ category, sub, drop, slug, name, kicker, spec, price, colors, img: `${slug}.jpg`, sizeType: { clothing: 'alpha', shoes: 'shoe', bags: 'one', accessories: 'belt' }[category], ...o });
+const CATEGORY_IMAGES = { clothing: 'clothes.png', shoes: 'shopping.png', bags: 'bags.png', accessories: 'clothes.png' };
+const mk = (category, sub, drop, slug, name, kicker, spec, price, colors, o = {}) => ({ category, sub, drop, slug, name, kicker, spec, price, colors, img: CATEGORY_IMAGES[category], sizeType: { clothing: 'alpha', shoes: 'shoe', bags: 'one', accessories: 'belt' }[category], ...o });
 const B = (text, tone) => ({ text, tone });
 export const CATALOG = [
   // Clothing
