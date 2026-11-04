@@ -41,3 +41,13 @@ export function order(b = {}, shippingFee) {
 }
 
 export const email = (e) => { const x = s(e, 150).toLowerCase(); return emailOk(x) ? { data: x } : { error: 'Please enter a valid email address.' }; };
+
+export function authCredentials(b = {}) {
+  const emailResult = email(b.email);
+  const password = String(b.password || '');
+  const name = s(b.name, 100);
+  if (emailResult.error) return { error: emailResult.error };
+  if (password.length < 8) return { error: 'Password must be at least 8 characters.' };
+  if (name.length < 2) return { error: 'Please enter your name.' };
+  return { data: { email: emailResult.data, password, name } };
+}

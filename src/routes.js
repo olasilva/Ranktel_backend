@@ -4,18 +4,65 @@ import { MAIN, LOOK, ALIKE, ARRIVALS, CATALOG, SUBS, SEED_REVIEWS, getProduct, p
 import { add, update, list, find } from './store.js';
 import * as v from './validate.js';
 import * as paystack from './paystack.js';
+import { supabase } from './supabase.js';
 
 const r = Router();
 const shippingFee = () => Number(process.env.SHIPPING_FEE || 0);
+const referralReward = () => Number(process.env.REFERRAL_REWARD || 1000);
 const origin = () => (process.env.CLIENT_ORIGIN || 'http://localhost:5173').split(',')[0];
 const adminOnly = (req, res, next) => (process.env.ADMIN_KEY && req.get('x-admin-key') === process.env.ADMIN_KEY ? next() : res.status(401).json({ error: 'Unauthorized' }));
-const wrap = (fn) => (req, res, next) => fn(req, res).catch(next);
+const wrap = (fn) => (req, res, next) => fn(req, res, next).catch(next);
 
 r.get('/health', (_req, res) => res.json({ ok: true }));
 
 const cfg = () => ({ shippingFee: shippingFee(), paystack: paystack.paystackEnabled(), pickup: 'Kurudu, Abuja FCT' });
 r.get('/config', (_req, res) => res.json(cfg()));
 r.get('/home', (_req, res) => res.json({ arrivals: ARRIVALS }));
+
+const authUnavailable = (res) => res.status(503).json({ error: 'Accounts are not available right now. Please try again later.' });
+const authResult = (session, user) => ({ token: session.access_token, user: { id: user.id, email: user.email, name: user.user_metadata?.name || '' } });
+const getUser = async (req) => {
+  if (!supabase) return null;
+  const token = String(req.get('authorization') || '').replace(/^Bearer\s+/i, '');
+  if (!token) return null;
+  const result = await supabase.auth.getUser(token);
+  return result.error ? null : result.data.user;
+};
+const requireUser = wrap(async (req, res, next) => {
+  const user = await getUser(req);
+  if (!user) return res.status(401).json({ error: 'Sign in required.' });
+  req.user = user;
+  next();
+});
+
+r.post('/auth/register', wrap(async (req, res) => {
+  if (!supabase) return authUnavailable(res);
+  const { data, error } = v.authCredentials(req.body);
+  if (error) return res.status(400).json({ error });
+  const created = await supabase.auth.admin.createUser({ email: data.email, password: data.password, email_confirm: true, user_metadata: { name: data.name } });
+  if (created.error) return res.status(400).json({ error: created.error.message });
+  const signedIn = await supabase.auth.signInWithPassword({ email: data.email, password: data.password });
+  if (signedIn.error) return res.status(502).json({ error: 'Account created, but sign-in failed. Please sign in again.' });
+  res.status(201).json(authResult(signedIn.data.session, signedIn.data.user));
+}));
+
+r.post('/auth/login', wrap(async (req, res) => {
+  if (!supabase) return authUnavailable(res);
+  const { data, error } = v.authCredentials({ ...req.body, name: 'Account' });
+  if (error) return res.status(400).json({ error });
+  const signedIn = await supabase.auth.signInWithPassword({ email: data.email, password: data.password });
+  if (signedIn.error) return res.status(401).json({ error: 'Email or password is incorrect.' });
+  res.json(authResult(signedIn.data.session, signedIn.data.user));
+}));
+
+r.get('/auth/me', wrap(async (req, res) => {
+  if (!supabase) return authUnavailable(res);
+  const token = String(req.get('authorization') || '').replace(/^Bearer\s+/i, '');
+  if (!token) return res.status(401).json({ error: 'Sign in required.' });
+  const result = await supabase.auth.getUser(token);
+  if (result.error) return res.status(401).json({ error: 'Your session has expired. Please sign in again.' });
+  res.json({ user: { id: result.data.user.id, email: result.data.user.email, name: result.data.user.user_metadata?.name || '' } });
+}));
 
 r.get('/catalog', (req, res) => {
   const cat = String(req.query.category || 'clothing');
@@ -59,19 +106,34 @@ r.post('/reviews', wrap(async (req, res) => {
 }));
 
 r.post('/orders', wrap(async (req, res) => {
+  const user = await getUser(req);
+  if (!user) return res.status(401).json({ error: 'Sign in required before checkout.' });
   const { data, error } = v.order(req.body, shippingFee());
   if (error) return res.status(400).json({ error });
   if (data.payment === 'paystack' && !paystack.paystackEnabled()) return res.status(503).json({ error: 'Online payment is not available right now. Choose Pay at Store or try again later.' });
   const orderNo = 'RK-' + crypto.randomBytes(4).toString('hex').toUpperCase();
-  const row = await add('orders', { orderNo, ...data, status: data.payment === 'store' ? 'awaiting_store_payment' : 'pending_payment', ...(data.payment === 'store' ? { holdUntil: new Date(Date.now() + 48 * 36e5).toISOString() } : {}) });
-  if (data.payment === 'store') return res.status(201).json({ orderNo, total: data.total, pickup: true, holdUntil: row.holdUntil });
+  const trackingId = 'RT-' + crypto.randomBytes(5).toString('hex').toUpperCase();
+  const referralCode = String(req.body.referralCode || '').trim().toUpperCase();
+  const row = await add('orders', { userId: user.id, orderNo, trackingId, ...data, ...(referralCode.match(/^RK-[A-Z0-9]{8}$/) ? { referralCode } : {}), status: data.payment === 'store' ? 'awaiting_store_payment' : 'pending_payment', ...(data.payment === 'store' ? { holdUntil: new Date(Date.now() + 48 * 36e5).toISOString() } : {}) });
+  if (data.payment === 'store') return res.status(201).json({ orderNo, trackingId, total: data.total, pickup: true, holdUntil: row.holdUntil });
   try {
     const t = await paystack.initialize({ email: data.customer.email, amountNaira: data.total, reference: orderNo, callbackUrl: `${origin()}/`, metadata: { orderId: row.id } });
-    res.status(201).json({ orderNo, total: data.total, authorizationUrl: t.authorization_url });
+    res.status(201).json({ orderNo, trackingId, total: data.total, authorizationUrl: t.authorization_url });
   } catch (e) {
     console.error(e);
     res.status(502).json({ error: 'Could not start payment. Please try again.' });
   }
+}));
+
+r.get('/orders/mine', requireUser, wrap(async (req, res) => {
+  const orders = (await list('orders')).filter((order) => order.userId === req.user.id || order.customer?.email?.toLowerCase() === req.user.email?.toLowerCase());
+  res.json({ orders });
+}));
+
+r.get('/referrals', requireUser, wrap(async (req, res) => {
+  const code = `RK-${req.user.id.replace(/-/g, '').slice(0, 8).toUpperCase()}`;
+  const referred = (await list('orders')).filter((order) => order.referralCode === code && order.status === 'paid');
+  res.json({ code, completed: referred.length, earned: referred.length * referralReward() });
 }));
 
 async function markPaidIfValid(tx) {
@@ -88,7 +150,7 @@ r.get('/orders/verify/:reference', wrap(async (req, res) => {
   const tx = await paystack.verify(req.params.reference);
   const order = await markPaidIfValid(tx);
   if (!order) return res.status(404).json({ error: 'Order not found' });
-  res.json({ orderNo: order.orderNo, status: order.status, total: order.total });
+  res.json({ orderNo: order.orderNo, trackingId: order.trackingId, status: order.status, total: order.total });
 }));
 
 r.post('/webhooks/paystack', wrap(async (req, res) => {
