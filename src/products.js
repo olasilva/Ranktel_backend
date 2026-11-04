@@ -79,6 +79,10 @@ export const CATALOG = [
   mk('accessories', null, 400, 'brutalist-buckle-leather-belt', 'Brutalist Buckle Leather Belt', 'Full grain bridle', '', 19500, ['black', 'brown']),
 ];
 const bySlug = Object.fromEntries(CATALOG.map((i) => [i.slug, i]));
+export const applyProductOverride = (override = {}) => {
+  const product = override.slug === MAIN.slug ? MAIN : bySlug[override.slug];
+  if (product) Object.assign(product, override);
+};
 export const stateOf = (i) => i.stock || 'in';
 const metaOf = (i) => (i.range ? `Unisex • ${i.range[0]}-${i.range[1]}` : i.spec);
 export const pub = (i) => ({ slug: i.slug, category: i.category, name: i.name, kicker: i.kicker, blurb: i.blurb, price: i.price, compareAt: i.compareAt, colors: i.colors.map((c) => COLORS[c].hex), badge: i.badge, meta: metaOf(i), img: i.img, stockState: stateOf(i) });

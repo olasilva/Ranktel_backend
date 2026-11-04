@@ -8,7 +8,7 @@ const file = (n) => path.join(dir, `${n}.json`);
 let q = Promise.resolve();
 async function read(n) { try { return JSON.parse(await fs.readFile(file(n), 'utf8')); } catch { return []; } }
 const run = (fn) => { const p = q.then(fn); q = p.catch(() => {}); return p; };
-const tableNames = new Set(['orders', 'reviews', 'subscribers']);
+const tableNames = new Set(['orders', 'reviews', 'subscribers', 'products', 'outreach']);
 const table = (n) => {
   if (!tableNames.has(n)) throw new Error(`Unknown store collection: ${n}`);
   return n;

@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import crypto from 'node:crypto';
-import { MAIN, LOOK, ALIKE, ARRIVALS, CATALOG, SUBS, SEED_REVIEWS, getProduct, pub, stateOf } from './products.js';
+import { MAIN, LOOK, ALIKE, ARRIVALS, CATALOG, SUBS, SEED_REVIEWS, getProduct, pub, stateOf, applyProductOverride } from './products.js';
 import { add, update, list, find } from './store.js';
 import * as v from './validate.js';
 import * as paystack from './paystack.js';
@@ -34,6 +34,9 @@ const requireUser = wrap(async (req, res, next) => {
   req.user = user;
   next();
 });
+const productOverridesReady = list('products')
+  .then((rows) => rows.forEach(applyProductOverride))
+  .catch((error) => console.error('Could not load product overrides:', error.message));
 
 r.post('/auth/register', wrap(async (req, res) => {
   if (!supabase) return authUnavailable(res);
@@ -64,7 +67,8 @@ r.get('/auth/me', wrap(async (req, res) => {
   res.json({ user: { id: result.data.user.id, email: result.data.user.email, name: result.data.user.user_metadata?.name || '' } });
 }));
 
-r.get('/catalog', (req, res) => {
+r.get('/catalog', wrap(async (req, res) => {
+  await productOverridesReady;
   const cat = String(req.query.category || 'clothing');
   if (!['clothing', 'shoes', 'bags', 'accessories', 'sale'].includes(cat)) return res.status(400).json({ error: 'Unknown category' });
   const all = (cat === 'sale' ? CATALOG.filter((i) => i.compareAt) : CATALOG.filter((i) => i.category === cat));
@@ -77,9 +81,10 @@ r.get('/catalog', (req, res) => {
   const page = Math.min(Math.max(parseInt(req.query.page, 10) || 1, 1), pages);
   const subs = (SUBS[cat] || []).map(([id, label]) => ({ id, label, count: all.filter((i) => i.sub === id).length })).filter((s) => s.count > 0);
   res.json({ items: rows.slice((page - 1) * limit, page * limit).map(pub), total: rows.length, categoryTotal: all.length, page, pages, subs });
-});
+}));
 
 r.get('/products/:slug', wrap(async (req, res) => {
+  await productOverridesReady;
   const product = getProduct(req.params.slug);
   if (!product) return res.status(404).json({ error: 'Product not found' });
   if (product.slug !== MAIN.slug) {
@@ -106,6 +111,7 @@ r.post('/reviews', wrap(async (req, res) => {
 }));
 
 r.post('/orders', wrap(async (req, res) => {
+  await productOverridesReady;
   const user = await getUser(req);
   if (!user) return res.status(401).json({ error: 'Sign in required before checkout.' });
   const { data, error } = v.order(req.body, shippingFee());
@@ -160,7 +166,35 @@ r.post('/webhooks/paystack', wrap(async (req, res) => {
 }));
 
 r.get('/admin/orders', adminOnly, wrap(async (_req, res) => res.json(await list('orders'))));
+r.get('/admin/products', adminOnly, wrap(async (_req, res) => {
+  await productOverridesReady;
+  res.json([MAIN, ...CATALOG.filter((product) => product.slug !== MAIN.slug)].map((product) => ({ ...product, colors: undefined })));
+}));
+r.patch('/admin/products/:slug', adminOnly, wrap(async (req, res) => {
+  await productOverridesReady;
+  const product = [MAIN, ...CATALOG].find((item) => item.slug === req.params.slug);
+  if (!product) return res.status(404).json({ error: 'Product not found.' });
+  const allowed = ['name', 'price', 'compareAt', 'category', 'sub', 'kicker', 'spec', 'stock'];
+  const patch = {};
+  for (const key of allowed) {
+    if (req.body?.[key] !== undefined) patch[key] = key === 'price' || key === 'compareAt' ? Number(req.body[key]) : req.body[key];
+  }
+  if (patch.price !== undefined && (!Number.isFinite(patch.price) || patch.price < 0)) return res.status(400).json({ error: 'Price must be a non-negative number.' });
+  if (patch.compareAt !== undefined && (!Number.isFinite(patch.compareAt) || patch.compareAt < 0)) return res.status(400).json({ error: 'Compare-at price must be a non-negative number.' });
+  if (patch.stock !== undefined && !['in', 'low', 'out'].includes(patch.stock)) return res.status(400).json({ error: 'Stock must be in, low or out.' });
+  Object.assign(product, patch);
+  await update('products', (item) => item.slug === product.slug, patch) || await add('products', { slug: product.slug, ...patch });
+  res.json({ product: { ...product, colors: undefined } });
+}));
 r.get('/admin/subscribers', adminOnly, wrap(async (_req, res) => res.json(await list('subscribers'))));
+r.post('/admin/outreach', adminOnly, wrap(async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const subject = String(req.body?.subject || '').trim().slice(0, 160);
+  const message = String(req.body?.message || '').trim().slice(0, 2000);
+  if (!/^\S+@\S+\.\S+$/.test(email) || !subject || !message) return res.status(400).json({ error: 'Customer email, subject and message are required.' });
+  const row = await add('outreach', { email, subject, message, status: 'queued' });
+  res.status(201).json({ outreach: row, mailto: `mailto:${encodeURIComponent(email)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(message)}` });
+}));
 r.get('/admin/reviews', adminOnly, wrap(async (_req, res) => res.json(await list('reviews'))));
 r.post('/admin/reviews/:id/approve', adminOnly, wrap(async (req, res) => {
   const row = await update('reviews', (x) => x.id === req.params.id, { approved: true });
