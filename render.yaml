@@ -3,7 +3,8 @@ services:
     name: ranktel-backend
     runtime: node
     buildCommand: npm ci
-    startCommand: npm start
+    # Changed from 'npm start' to run node directly, bypassing npm's signal handling issues
+    startCommand: node src/server.js
     healthCheckPath: /api/health
     autoDeploy: true
     envVars:
@@ -12,9 +13,11 @@ services:
       - key: PORT
         value: 10000
       - key: CLIENT_ORIGIN
-        sync: false
+        value: https://dranks-frontend.vercel.app
       - key: ADMIN_KEY
         generateValue: true
+      - key: ADMIN_EMAIL
+        sync: false
       - key: PAYSTACK_SECRET_KEY
         sync: false
       - key: SHIPPING_FEE

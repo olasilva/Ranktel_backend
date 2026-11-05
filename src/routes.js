@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import crypto from 'node:crypto';
-import { MAIN, LOOK, ALIKE, ARRIVALS, CATALOG, SUBS, SEED_REVIEWS, getProduct, pub, stateOf, applyProductOverride } from './products.js';
+import { MAIN, LOOK, ALIKE, ARRIVALS, CATALOG, SUBS, SEED_REVIEWS, getProduct, pub, stateOf, applyProductOverride, registerProduct } from './products.js';
 import { add, update, list, find } from './store.js';
 import * as v from './validate.js';
 import * as paystack from './paystack.js';
@@ -21,7 +21,8 @@ r.get('/config', (_req, res) => res.json(cfg()));
 r.get('/home', (_req, res) => res.json({ arrivals: ARRIVALS }));
 
 const authUnavailable = (res) => res.status(503).json({ error: 'Accounts are not available right now. Please try again later.' });
-const authResult = (session, user) => ({ token: session.access_token, user: { id: user.id, email: user.email, name: user.user_metadata?.name || '' } });
+const userRole = (user) => user.user_metadata?.role || (process.env.ADMIN_EMAIL && user.email?.toLowerCase() === process.env.ADMIN_EMAIL.toLowerCase() ? 'admin' : 'customer');
+const authResult = (session, user) => ({ token: session.access_token, user: { id: user.id, email: user.email, name: user.user_metadata?.name || user.user_metadata?.full_name || '', full_name: user.user_metadata?.full_name || user.user_metadata?.name || '', role: userRole(user), branch_id: user.user_metadata?.branch_id || null, branch_name: user.user_metadata?.branch_name || null } });
 const getUser = async (req) => {
   if (!supabase) return null;
   const token = String(req.get('authorization') || '').replace(/^Bearer\s+/i, '');
@@ -35,6 +36,20 @@ const requireUser = wrap(async (req, res, next) => {
   req.user = user;
   next();
 });
+const requireStaff = wrap(async (req, res, next) => {
+  const user = await getUser(req);
+  if (!user || !['admin', 'staff'].includes(userRole(user))) return res.status(401).json({ error: 'Staff sign in required.' });
+  req.user = user;
+  req.role = userRole(user);
+  next();
+});
+const requireAdmin = wrap(async (req, res, next) => {
+  const user = await getUser(req);
+  if (!user || userRole(user) !== 'admin') return res.status(403).json({ error: 'Admin access required.' });
+  req.user = user;
+  req.role = 'admin';
+  next();
+});
 const ownsOrder = (order, user) => order && (order.userId === user.id || order.customer?.email?.toLowerCase() === user.email?.toLowerCase());
 const publicTracking = (order) => ({
   orderNo: order.orderNo,
@@ -45,7 +60,10 @@ const publicTracking = (order) => ({
   tracking: order.tracking || initialTracking(order.status, order.createdAt)
 });
 const productOverridesReady = list('products')
-  .then((rows) => rows.forEach(applyProductOverride))
+  .then((rows) => rows.filter((row) => !row.archived).forEach((row) => {
+    applyProductOverride(row);
+    if (!getProduct(row.slug)) registerProduct(row);
+  }))
   .catch((error) => console.error('Could not load product overrides:', error.message));
 
 r.post('/auth/register', wrap(async (req, res) => {
@@ -74,7 +92,71 @@ r.get('/auth/me', wrap(async (req, res) => {
   if (!token) return res.status(401).json({ error: 'Sign in required.' });
   const result = await supabase.auth.getUser(token);
   if (result.error) return res.status(401).json({ error: 'Your session has expired. Please sign in again.' });
-  res.json({ user: { id: result.data.user.id, email: result.data.user.email, name: result.data.user.user_metadata?.name || '' } });
+  res.json({ user: authResult({ access_token: '' }, result.data.user).user });
+}));
+
+r.get('/branches', requireStaff, (_req, res) => res.json([{ id: 1, name: 'Kurudu, Abuja' }]));
+r.get('/branches/summary', requireAdmin, wrap(async (_req, res) => {
+  const [users, products, orders] = await Promise.all([
+    supabase.auth.admin.listUsers({ perPage: 1000 }),
+    list('products'),
+    list('orders')
+  ]);
+  if (users.error) throw new Error(`Could not load staff: ${users.error.message}`);
+  res.json([{ id: 1, name: 'Kurudu, Abuja', staff: users.data.users.filter((user) => user.user_metadata?.role === 'staff').length, products: products.filter((product) => !product.archived).length, revenue_today: orders.filter((order) => order.status === 'completed').reduce((sum, order) => sum + Number(order.total || 0), 0) }]);
+}));
+
+r.get('/staff', requireAdmin, wrap(async (_req, res) => {
+  const result = await supabase.auth.admin.listUsers({ perPage: 1000 });
+  if (result.error) throw new Error(`Could not load staff: ${result.error.message}`);
+  res.json(result.data.users.filter((user) => user.user_metadata?.role === 'staff').map((user) => ({
+    id: user.id,
+    full_name: user.user_metadata?.full_name || user.user_metadata?.name || '',
+    email: user.email,
+    active: !user.banned_until,
+    last_login: user.last_sign_in_at,
+    branch_id: user.user_metadata?.branch_id || 1
+  })));
+}));
+
+r.get('/staff/all', requireAdmin, wrap(async (req, res) => {
+  const result = await supabase.auth.admin.listUsers({ perPage: 1000 });
+  if (result.error) throw new Error(`Could not load staff: ${result.error.message}`);
+  res.json(result.data.users.filter((user) => user.user_metadata?.role === 'staff').map((user) => ({
+    id: user.id,
+    full_name: user.user_metadata?.full_name || user.user_metadata?.name || '',
+    email: user.email,
+    branch_id: user.user_metadata?.branch_id || 1
+  })));
+}));
+
+r.post('/staff', requireAdmin, wrap(async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const fullName = String(req.body?.full_name || '').trim().slice(0, 100);
+  const password = String(req.body?.password || '');
+  if (!/^\S+@\S+\.\S+$/.test(email) || fullName.length < 2 || password.length < 8) return res.status(400).json({ error: 'Name, valid email, and password of at least 8 characters are required.' });
+  const created = await supabase.auth.admin.createUser({ email, password, email_confirm: true, user_metadata: { role: 'staff', full_name: fullName, name: fullName, branch_id: 1, branch_name: 'Kurudu, Abuja' } });
+  if (created.error) return res.status(400).json({ error: created.error.message });
+  res.status(201).json({ id: created.data.user.id, email, full_name: fullName, active: true, email_sent: false, email_message: 'Share the staff login credentials securely.' });
+}));
+
+r.patch('/staff/:id', requireAdmin, wrap(async (req, res) => {
+  const current = await supabase.auth.admin.getUserById(req.params.id);
+  if (current.error || current.data.user?.user_metadata?.role !== 'staff') return res.status(404).json({ error: 'Staff member not found.' });
+  const metadata = { ...current.data.user.user_metadata };
+  if (req.body?.branch_id !== undefined) metadata.branch_id = req.body.branch_id ? Number(req.body.branch_id) : null;
+  if (req.body?.active !== undefined) {
+    const updated = await supabase.auth.admin.updateUserById(req.params.id, { ban_duration: req.body.active ? 'none' : '876000h', user_metadata: metadata });
+    if (updated.error) throw new Error(`Could not update staff: ${updated.error.message}`);
+  } else if (req.body?.password) {
+    if (String(req.body.password).length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+    const updated = await supabase.auth.admin.updateUserById(req.params.id, { password: String(req.body.password), user_metadata: metadata });
+    if (updated.error) throw new Error(`Could not update staff: ${updated.error.message}`);
+  } else {
+    const updated = await supabase.auth.admin.updateUserById(req.params.id, { user_metadata: metadata });
+    if (updated.error) throw new Error(`Could not update staff: ${updated.error.message}`);
+  }
+  res.json({ ok: true });
 }));
 
 r.get('/catalog', wrap(async (req, res) => {
@@ -104,6 +186,57 @@ r.get('/products/:slug', wrap(async (req, res) => {
   const stored = (await list('reviews')).filter((x) => x.approved);
   const reviews = [...stored, ...SEED_REVIEWS].sort((a, b) => b.createdAt - a.createdAt || 0).slice(0, 9);
   res.json({ product, reviews, related: { look: LOOK, alike: ALIKE }, config: cfg() });
+}));
+
+const inventoryProduct = (item) => ({
+  id: item.id || item.slug,
+  slug: item.slug,
+  name: item.name,
+  category: item.category || 'clothing',
+  price: Number(item.price) || 0,
+  stock: Number(item.inventoryStock ?? (stateOf(item) === 'out' ? 0 : 1)),
+  image_url: item.image_url || item.img || null
+});
+
+r.get('/products', requireStaff, wrap(async (_req, res) => {
+  await productOverridesReady;
+  const stored = (await list('products')).filter((item) => !item.archived);
+  const storedSlugs = new Set(stored.map((item) => item.slug));
+  const catalogue = CATALOG.filter((item) => !storedSlugs.has(item.slug)).map(inventoryProduct);
+  res.json([...stored.map(inventoryProduct), ...catalogue]);
+}));
+
+r.post('/products', requireAdmin, wrap(async (req, res) => {
+  const name = String(req.body?.name || '').trim().slice(0, 120);
+  const category = String(req.body?.category || 'clothing').trim().slice(0, 60);
+  const price = Number(req.body?.price);
+  const inventoryStock = Number(req.body?.stock);
+  const imageUrl = req.body?.image_url == null ? null : String(req.body.image_url).slice(0, 2_800_000);
+  if (name.length < 2 || !Number.isFinite(price) || price < 0 || !Number.isInteger(inventoryStock) || inventoryStock < 0) {
+    return res.status(400).json({ error: 'Name, non-negative price, and whole-number stock are required.' });
+  }
+  const slug = `${name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}-${crypto.randomBytes(3).toString('hex')}`;
+  const row = await add('products', { slug, name, category, price, inventoryStock, image_url: imageUrl, colors: ['black'] });
+  registerProduct(row);
+  res.status(201).json(inventoryProduct(row));
+}));
+
+r.put('/products/:id', requireAdmin, wrap(async (req, res) => {
+  const price = Number(req.body?.price);
+  const inventoryStock = Number(req.body?.stock);
+  if (!Number.isFinite(price) || price < 0 || !Number.isInteger(inventoryStock) || inventoryStock < 0) return res.status(400).json({ error: 'Price and stock are invalid.' });
+  const current = await find('products', (item) => item.id === req.params.id || item.slug === req.params.id);
+  if (!current) return res.status(404).json({ error: 'Product not found.' });
+  const row = await update('products', (item) => item.id === current.id, { price, inventoryStock, image_url: req.body?.image_url == null ? current.image_url || null : String(req.body.image_url).slice(0, 2_800_000) });
+  applyProductOverride(row);
+  res.json(inventoryProduct(row));
+}));
+
+r.delete('/products/:id', requireAdmin, wrap(async (req, res) => {
+  const current = await find('products', (item) => item.id === req.params.id || item.slug === req.params.id);
+  if (!current) return res.status(404).json({ error: 'Product not found.' });
+  const removed = await update('products', (item) => item.id === current.id, { archived: true });
+  res.json({ ok: true, product: inventoryProduct(removed) });
 }));
 
 r.post('/newsletter', wrap(async (req, res) => {
@@ -145,6 +278,27 @@ r.post('/orders', wrap(async (req, res) => {
 r.get('/orders/mine', requireUser, wrap(async (req, res) => {
   const orders = (await list('orders')).filter((order) => order.userId === req.user.id || order.customer?.email?.toLowerCase() === req.user.email?.toLowerCase());
   res.json({ orders });
+}));
+
+r.get('/orders/incoming', requireStaff, wrap(async (_req, res) => {
+  const orders = (await list('orders'))
+    .filter((order) => !['pending_payment', 'cancelled', 'completed'].includes(order.status))
+    .map((order) => ({ ...order, tracking: order.tracking || initialTracking(order.status, order.createdAt) }));
+  res.json({ orders });
+}));
+
+r.patch('/orders/:orderNo/status', requireStaff, wrap(async (req, res) => {
+  const { status, location, eta, note } = req.body || {};
+  if (!TRACKING_STATUSES.includes(status)) return res.status(400).json({ error: `status must be one of ${TRACKING_STATUSES.join(', ')}` });
+  const current = await find('orders', (order) => order.orderNo === req.params.orderNo);
+  if (!current) return res.status(404).json({ error: 'Order not found.' });
+  const row = await update('orders', (order) => order.orderNo === req.params.orderNo, {
+    status,
+    processedBy: req.user.id,
+    tracking: updateTracking(current.tracking, status, { location, eta, note })
+  });
+  publish(row.trackingId, publicTracking(row));
+  res.json(row);
 }));
 
 r.get('/orders/track/:trackingId', requireUser, wrap(async (req, res) => {

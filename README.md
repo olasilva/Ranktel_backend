@@ -4,6 +4,10 @@
     npm install
     npm run dev              # http://localhost:5000
 
+Apply all SQL files in `supabase/migrations` to the connected Supabase project.
+If the project already had a `products` table, apply `003_products_data_compatibility.sql`
+as well; `CREATE TABLE IF NOT EXISTS` does not add columns to an existing table.
+
 ## API
 - GET  /api/config                      shipping fee, Paystack on/off, pickup location
 - GET  /api/home                        new arrivals for the home page
@@ -22,6 +26,19 @@ Admin status updates accept `status`, and optionally `location: { label }`, `eta
 Allowed tracking statuses are `paid`, `processing`, `ready_for_pickup`, `shipped`, `in_transit`,
 `out_for_delivery`, `completed`, and `cancelled`. Buyers receive the current state and history
 through the snapshot endpoint and immediately receive changes over Server-Sent Events.
+
+## Admin and staff inventory
+
+Set `ADMIN_EMAIL` to the Supabase email used for the admin dashboard. That account
+must have `role: "admin"` in its Supabase user metadata (the email is also accepted
+as the admin fallback). Staff accounts are created from the dashboard and receive
+`role: "staff"` automatically. Set the Vercel frontend variable `VITE_API_URL`
+to the deployed Render API origin, without a trailing slash.
+
+Admin and staff use `/api/products` for shared inventory. Products created by an
+admin are stored in Supabase and are added to the customer storefront catalogue.
+Incoming customer orders are available at `/api/orders/incoming`; staff can update
+their processing status at `/api/orders/:orderNo/status`.
 
 Prices and stock are read from src/products.js on the server; the browser cannot change them.
 Orders and reviews are saved in data/*.json (swap src/store.js for a real database in production).

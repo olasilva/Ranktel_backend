@@ -84,6 +84,27 @@ export const applyProductOverride = (override = {}) => {
   const product = override.slug === MAIN.slug ? MAIN : bySlug[override.slug];
   if (product) Object.assign(product, override);
 };
+export const registerProduct = (product = {}) => {
+  if (!product.slug || bySlug[product.slug]) return;
+  const item = {
+    category: product.category || 'clothing',
+    sub: product.sub || null,
+    drop: Date.now(),
+    slug: product.slug,
+    name: product.name,
+    kicker: product.kicker || 'Ranktel collection',
+    spec: product.spec || '',
+    price: Number(product.price) || 0,
+    colors: Array.isArray(product.colors) && product.colors.length ? product.colors : ['black'],
+    img: product.img || product.image_url || 'clothes.png',
+    stock: product.inventoryStock > 0 ? 'in' : 'out',
+    inventoryStock: Number(product.inventoryStock) || 0,
+    compareAt: product.compareAt,
+    image_url: product.image_url || product.img || null
+  };
+  bySlug[item.slug] = item;
+  CATALOG.push(item);
+};
 export const stateOf = (i) => i.stock || 'in';
 const metaOf = (i) => (i.range ? `Unisex • ${i.range[0]}-${i.range[1]}` : i.spec);
 export const pub = (i) => ({ slug: i.slug, category: i.category, name: i.name, kicker: i.kicker, blurb: i.blurb, price: i.price, compareAt: i.compareAt, colors: i.colors.map((c) => COLORS[c].hex), badge: i.badge, meta: metaOf(i), img: i.img, stockState: stateOf(i) });
