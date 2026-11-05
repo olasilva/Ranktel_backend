@@ -5,6 +5,7 @@ import { add, update, list, find } from './store.js';
 import * as v from './validate.js';
 import * as paystack from './paystack.js';
 import { supabase } from './supabase.js';
+import { TRACKING_STATUSES, initialTracking, updateTracking, subscribe, publish } from './tracking.js';
 
 const r = Router();
 const shippingFee = () => Number(process.env.SHIPPING_FEE || 0);
@@ -33,6 +34,15 @@ const requireUser = wrap(async (req, res, next) => {
   if (!user) return res.status(401).json({ error: 'Sign in required.' });
   req.user = user;
   next();
+});
+const ownsOrder = (order, user) => order && (order.userId === user.id || order.customer?.email?.toLowerCase() === user.email?.toLowerCase());
+const publicTracking = (order) => ({
+  orderNo: order.orderNo,
+  trackingId: order.trackingId,
+  status: order.status,
+  total: order.total,
+  delivery: order.delivery,
+  tracking: order.tracking || initialTracking(order.status, order.createdAt)
 });
 const productOverridesReady = list('products')
   .then((rows) => rows.forEach(applyProductOverride))
@@ -120,7 +130,8 @@ r.post('/orders', wrap(async (req, res) => {
   const orderNo = 'RK-' + crypto.randomBytes(4).toString('hex').toUpperCase();
   const trackingId = 'RT-' + crypto.randomBytes(5).toString('hex').toUpperCase();
   const referralCode = String(req.body.referralCode || '').trim().toUpperCase();
-  const row = await add('orders', { userId: user.id, orderNo, trackingId, ...data, ...(referralCode.match(/^RK-[A-Z0-9]{8}$/) ? { referralCode } : {}), status: data.payment === 'store' ? 'awaiting_store_payment' : 'pending_payment', ...(data.payment === 'store' ? { holdUntil: new Date(Date.now() + 48 * 36e5).toISOString() } : {}) });
+  const status = data.payment === 'store' ? 'awaiting_store_payment' : 'pending_payment';
+  const row = await add('orders', { userId: user.id, orderNo, trackingId, ...data, ...(referralCode.match(/^RK-[A-Z0-9]{8}$/) ? { referralCode } : {}), status, tracking: initialTracking(status), ...(data.payment === 'store' ? { holdUntil: new Date(Date.now() + 48 * 36e5).toISOString() } : {}) });
   if (data.payment === 'store') return res.status(201).json({ orderNo, trackingId, total: data.total, pickup: true, holdUntil: row.holdUntil });
   try {
     const t = await paystack.initialize({ email: data.customer.email, amountNaira: data.total, reference: orderNo, callbackUrl: `${origin()}/`, metadata: { orderId: row.id } });
@@ -136,6 +147,35 @@ r.get('/orders/mine', requireUser, wrap(async (req, res) => {
   res.json({ orders });
 }));
 
+r.get('/orders/track/:trackingId', requireUser, wrap(async (req, res) => {
+  const order = await find('orders', (item) => item.trackingId === req.params.trackingId);
+  if (!ownsOrder(order, req.user)) return res.status(404).json({ error: 'Tracking record not found.' });
+  res.json(publicTracking(order));
+}));
+
+r.get('/orders/track/:trackingId/stream', requireUser, async (req, res, next) => {
+  try {
+    const order = await find('orders', (item) => item.trackingId === req.params.trackingId);
+    if (!ownsOrder(order, req.user)) return res.status(404).json({ error: 'Tracking record not found.' });
+    res.status(200).set({
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no'
+    });
+    res.flushHeaders();
+    res.write(`event: tracking.updated\ndata: ${JSON.stringify(publicTracking(order))}\n\n`);
+    const unsubscribe = subscribe(order.trackingId, res);
+    const heartbeat = setInterval(() => res.write(': keep-alive\n\n'), 25000);
+    req.on('close', () => {
+      clearInterval(heartbeat);
+      unsubscribe();
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 r.get('/referrals', requireUser, wrap(async (req, res) => {
   const code = `RK-${req.user.id.replace(/-/g, '').slice(0, 8).toUpperCase()}`;
   const referred = (await list('orders')).filter((order) => order.referralCode === code && order.status === 'paid');
@@ -146,7 +186,10 @@ async function markPaidIfValid(tx) {
   const order = await find('orders', (o) => o.orderNo === tx.reference);
   if (!order) return null;
   if (tx.status === 'success' && tx.amount === order.total * 100 && tx.currency === 'NGN') {
-    return order.status === 'paid' ? order : update('orders', (o) => o.orderNo === tx.reference, { status: 'paid', paidAt: new Date().toISOString() });
+    if (order.status === 'paid') return order;
+    const next = await update('orders', (o) => o.orderNo === tx.reference, { status: 'paid', paidAt: new Date().toISOString(), tracking: updateTracking(order.tracking, 'paid') });
+    publish(next.trackingId, publicTracking(next));
+    return next;
   }
   return order;
 }
@@ -201,10 +244,21 @@ r.post('/admin/reviews/:id/approve', adminOnly, wrap(async (req, res) => {
   row ? res.json(row) : res.status(404).json({ error: 'Not found' });
 }));
 r.post('/admin/orders/:orderNo/status', adminOnly, wrap(async (req, res) => {
-  const allowed = ['paid', 'ready_for_pickup', 'shipped', 'completed', 'cancelled'];
-  if (!allowed.includes(req.body?.status)) return res.status(400).json({ error: `status must be one of ${allowed.join(', ')}` });
-  const row = await update('orders', (o) => o.orderNo === req.params.orderNo, { status: req.body.status });
-  row ? res.json(row) : res.status(404).json({ error: 'Not found' });
+  const { status, location, eta, note } = req.body || {};
+  if (!TRACKING_STATUSES.includes(status)) return res.status(400).json({ error: `status must be one of ${TRACKING_STATUSES.join(', ')}` });
+  if (location !== undefined && (location === null || typeof location !== 'object' || typeof location.label !== 'string' || location.label.length > 120)) {
+    return res.status(400).json({ error: 'location must be an object with a label of 120 characters or fewer.' });
+  }
+  if (eta !== undefined && eta !== null && (typeof eta !== 'string' || Number.isNaN(Date.parse(eta)))) return res.status(400).json({ error: 'eta must be an ISO date or null.' });
+  if (note !== undefined && note !== null && (typeof note !== 'string' || note.length > 300)) return res.status(400).json({ error: 'note must be 300 characters or fewer.' });
+  const current = await find('orders', (order) => order.orderNo === req.params.orderNo);
+  if (!current) return res.status(404).json({ error: 'Not found' });
+  const row = await update('orders', (o) => o.orderNo === req.params.orderNo, {
+    status,
+    tracking: updateTracking(current.tracking, status, { location, eta, note })
+  });
+  publish(row.trackingId, publicTracking(row));
+  res.json(row);
 }));
 
 export default r;

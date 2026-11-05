@@ -13,8 +13,15 @@
 - POST /api/reviews                     { name, location?, size?, rating, title, body }  (held until approved)
 - POST /api/orders                      { items:[{slug,color,size,qty}], customer:{name,phone,email,address?,city?}, delivery:"pickup"|"ship", payment:"paystack"|"store" }
 - GET  /api/orders/verify/:reference    confirms a Paystack payment and marks the order paid
+- GET  /api/orders/track/:trackingId    authenticated live-tracking snapshot for the buyer
+- GET  /api/orders/track/:trackingId/stream authenticated SSE stream for tracking updates
 - POST /api/webhooks/paystack           set this URL in the Paystack dashboard (signature verified)
 - Admin (header x-admin-key): GET /api/admin/orders, GET /api/admin/reviews, POST /api/admin/reviews/:id/approve, POST /api/admin/orders/:orderNo/status
+
+Admin status updates accept `status`, and optionally `location: { label }`, `eta` (ISO date), and `note`.
+Allowed tracking statuses are `paid`, `processing`, `ready_for_pickup`, `shipped`, `in_transit`,
+`out_for_delivery`, `completed`, and `cancelled`. Buyers receive the current state and history
+through the snapshot endpoint and immediately receive changes over Server-Sent Events.
 
 Prices and stock are read from src/products.js on the server; the browser cannot change them.
 Orders and reviews are saved in data/*.json (swap src/store.js for a real database in production).
