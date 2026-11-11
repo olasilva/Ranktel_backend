@@ -21,14 +21,25 @@ r.get('/config', (_req, res) => res.json(cfg()));
 r.get('/home', (_req, res) => res.json({ arrivals: ARRIVALS }));
 
 const authUnavailable = (res) => res.status(503).json({ error: 'Accounts are not available right now. Please try again later.' });
+class AuthServiceError extends Error {
+  constructor(cause) {
+    super('Could not verify the account session.', { cause });
+    this.statusCode = 503;
+  }
+}
 const userRole = (user) => user.user_metadata?.role || (process.env.ADMIN_EMAIL && user.email?.toLowerCase() === process.env.ADMIN_EMAIL.toLowerCase() ? 'admin' : 'customer');
 const authResult = (session, user) => ({ token: session.access_token, user: { id: user.id, email: user.email, name: user.user_metadata?.name || user.user_metadata?.full_name || '', full_name: user.user_metadata?.full_name || user.user_metadata?.name || '', role: userRole(user), branch_id: user.user_metadata?.branch_id || null, branch_name: user.user_metadata?.branch_name || null } });
 const getUser = async (req) => {
   if (!supabase) return null;
   const token = String(req.get('authorization') || '').replace(/^Bearer\s+/i, '');
   if (!token) return null;
-  const result = await supabase.auth.getUser(token);
-  return result.error ? null : result.data.user;
+  try {
+    const result = await supabase.auth.getUser(token);
+    return result.error ? null : result.data.user;
+  } catch (error) {
+    console.error('Supabase session verification failed:', error);
+    throw new AuthServiceError(error);
+  }
 };
 const requireUser = wrap(async (req, res, next) => {
   const user = await getUser(req);
